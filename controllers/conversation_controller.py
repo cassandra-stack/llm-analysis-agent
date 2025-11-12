@@ -7,6 +7,7 @@ import os
 import json
 import logging
 import time
+import re
 from pathlib import Path
 from markdown_pdf import MarkdownPdf, Section
 from sqlalchemy.orm import Session
@@ -29,6 +30,115 @@ GOOGLE_CLOUD_API_KEY = os.getenv("GOOGLE_CLOUD_API_KEY")
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Setup Gemini-specific logger for debugging
+gemini_logger = logging.getLogger("gemini_debug")
+gemini_handler = logging.FileHandler("gemini.log", encoding='utf-8')
+gemini_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+gemini_handler.setFormatter(gemini_formatter)
+gemini_logger.addHandler(gemini_handler)
+gemini_logger.setLevel(logging.DEBUG)
+gemini_logger.propagate = False  # Don't propagate to root logger
+
+def sanitize_json_string(text: str) -> str:
+    """Sanitize text content for JSON parsing by properly escaping characters"""
+    # Replace problematic characters that commonly cause JSON parsing errors
+    text = text.replace('\\', '\\\\')  # Escape backslashes first
+    text = text.replace('"', '\\"')    # Escape quotes
+    text = text.replace('\n', '\\n')   # Escape newlines
+    text = text.replace('\r', '\\r')   # Escape carriage returns
+    text = text.replace('\t', '\\t')   # Escape tabs
+    text = text.replace('\b', '\\b')   # Escape backspace
+    text = text.replace('\f', '\\f')   # Escape form feed
+    
+    # Remove any control characters that might cause issues
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+    
+    return text
+
+def extract_and_parse_json(response_text: str, conversation_id: str = None) -> dict:
+    """Extract and parse JSON from response text with comprehensive error handling and logging"""
+    
+    # Log the full response for debugging
+    gemini_logger.info(f"=== FULL RESPONSE START (conversation_id: {conversation_id}) ===")
+    gemini_logger.info(response_text)
+    gemini_logger.info(f"=== FULL RESPONSE END (conversation_id: {conversation_id}) ===")
+    
+    logger.info("Processing response to extract JSON")
+    
+    # Try to extract JSON from markdown code blocks
+    json_content = response_text.strip()
+    
+    if response_text.strip().startswith("```json"):
+        start_marker = "```json"
+        end_marker = "```"
+        start_idx = response_text.find(start_marker) + len(start_marker)
+        end_idx = response_text.rfind(end_marker)
+        if end_idx > start_idx:
+            json_content = response_text[start_idx:end_idx].strip()
+            logger.info("Extracted JSON from markdown code blocks")
+            gemini_logger.info(f"Extracted JSON content: {json_content[:500]}...")
+        else:
+            logger.warning("Found opening ```json but no closing ```, using full response")
+    else:
+        # Look for JSON-like content even without markdown
+        json_start = response_text.find('{')
+        json_end = response_text.rfind('}')
+        if json_start != -1 and json_end != -1 and json_end > json_start:
+            # Try to extract what looks like JSON
+            potential_json = response_text[json_start:json_end+1].strip()
+            # Check if it looks more like JSON than the full response
+            if potential_json.count('{') > 0 and potential_json.count('}') > 0:
+                json_content = potential_json
+                logger.info("Extracted JSON-like content from response")
+                gemini_logger.info(f"Extracted JSON-like content: {json_content[:500]}...")
+            else:
+                logger.info("Using full response as JSON content")
+        else:
+            logger.info("No clear JSON structure found, using full response")
+    
+    # Try multiple parsing strategies
+    parse_attempts = [
+        # First attempt: parse as-is
+        ("Direct parsing", lambda content: json.loads(content)),
+        # Second attempt: fix common quote issues
+        ("Fix quotes", lambda content: json.loads(content.replace('\\"', '"').replace('\\\\', '\\'))),
+        # Third attempt: remove control characters
+        ("Remove control chars", lambda content: json.loads(re.sub(r'[\x00-\x1f\x7f-\x9f]', '', content))),
+        # Fourth attempt: manually fix common escape issues
+        ("Fix escapes", lambda content: json.loads(
+            content.replace('\\n', '\\\\n')
+                  .replace('\\t', '\\\\t')
+                  .replace('\\r', '\\\\r')
+                  .replace('\\"', '\\\\"')
+        )),
+        # Fifth attempt: comprehensive sanitization
+        ("Full sanitization", lambda content: json.loads(sanitize_json_string(content)))
+    ]
+    
+    for attempt_name, parse_func in parse_attempts:
+        try:
+            response_data = parse_func(json_content)
+            logger.info(f"Successfully parsed JSON using: {attempt_name}")
+            gemini_logger.info(f"JSON parsing successful with method: {attempt_name}")
+            return response_data
+        except json.JSONDecodeError as e:
+            logger.warning(f"Parse attempt '{attempt_name}' failed: {str(e)}")
+            gemini_logger.error(f"Parse attempt '{attempt_name}' failed: {str(e)}")
+            gemini_logger.error(f"Error position: {e.pos if hasattr(e, 'pos') else 'unknown'}")
+            if hasattr(e, 'pos') and e.pos < len(json_content):
+                error_context = json_content[max(0, e.pos-100):e.pos+100]
+                gemini_logger.error(f"Error context: {error_context}")
+    
+    # If all attempts failed, log detailed information
+    logger.error("All JSON parse attempts failed")
+    gemini_logger.error("=== JSON PARSING FAILURE DETAILS ===")
+    gemini_logger.error(f"Original response length: {len(response_text)}")
+    gemini_logger.error(f"JSON content length: {len(json_content)}")
+    gemini_logger.error(f"JSON content preview (first 1000 chars): {json_content[:1000]}")
+    gemini_logger.error(f"JSON content preview (last 1000 chars): {json_content[-1000:]}")
+    
+    raise HTTPException(status_code=500, detail="Failed to parse AI response as JSON - check gemini.log for details")
 
 def read_system_prompt() -> str:
     """Read system prompt from text file"""
@@ -257,25 +367,16 @@ async def start_conversation(req: StartConversationRequest, db: Session) -> Star
     
     # Extract JSON from markdown code blocks and then extract report_md
     logger.info("Processing response to extract report markdown")
-    if response_text.strip().startswith("```json"):
-        start_marker = "```json"
-        end_marker = "```"
-        start_idx = response_text.find(start_marker) + len(start_marker)
-        end_idx = response_text.rfind(end_marker)
-        json_content = response_text[start_idx:end_idx].strip()
-        logger.info("Extracted JSON from markdown code blocks")
-    else:
-        json_content = response_text.strip()
-        logger.info("Using response as-is (no markdown code blocks)")
-    
-    # Parse JSON and extract report_md
     try:
-        response_data = json.loads(json_content)
+        response_data = extract_and_parse_json(response_text, conversation_id)
         logger.info("Successfully parsed JSON response")
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse JSON response: {str(e)}")
-        logger.error(f"JSON content preview: {json_content[:200]}...")
+        logger.error(f"JSON content preview: {response_text[:200]}...")
         raise HTTPException(status_code=500, detail="Failed to parse AI response as JSON")
+    except Exception as e:
+        logger.error(f"Unexpected error during JSON parsing: {str(e)}")
+        raise HTTPException(status_code=500, detail="Unexpected error processing AI response")
     
     # Extract the report_md content from the patient data
     if isinstance(response_data, list) and len(response_data) > 0:

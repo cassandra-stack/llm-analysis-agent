@@ -17,8 +17,15 @@ Analysis Requirements:
    - Volumes < 0.05 mL are highly sensitive to noise → mention in notes
    - asymmetry_index = -1.0 may be a sentinel value (not calculated) → flag it
 
-4. Output Format (strict JSON schema):
+4. JSON Format Requirements:
+   - ALWAYS wrap your response in ```json and ``` markers
+   - Escape all special characters in strings (backslashes, quotes, newlines)
+   - For report_md field: use \\n for newlines, \\" for quotes, \\\\ for backslashes
+   - Ensure all JSON is properly formatted and valid
 
+5. Output Format (strict JSON schema):
+
+```json
 [
   {
     "patient": "string",
@@ -32,13 +39,15 @@ Analysis Requirements:
     "decision": "tumor_probable | tumor_possible | no_tumor_detected",
     "rationale": "string (1-3 sentences, concise)",
     "disclaimer": "string",
-    "report_md": "string (complete Markdown)"
+    "report_md": "string (complete Markdown with proper JSON escaping)"
   }
 ]
+```
 
-5. Requirements for report_md:
+6. Requirements for report_md:
    - Use Markdown headings (#, ##), tables, and bullet points
    - Professional style suitable for PDF export
    - Include: header (patient, date, study), KPIs, volume table, centroid position, 
      decision & rationale, limitations, glossary
    - No external links or images
+   - IMPORTANT: Properly escape all special characters for JSON (newlines as \\n, quotes as \\", backslashes as \\\\)
